@@ -1,7 +1,8 @@
 use std::alloc::{alloc_zeroed, dealloc, Layout};
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::ptr::null;
 
+use windows_sys::core::GUID;
 use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_SUCCESS};
 use windows_sys::Win32::Globalization::{CP_ACP, MB_ERR_INVALID_CHARS, MB_PRECOMPOSED, MultiByteToWideChar};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
@@ -9,7 +10,7 @@ use windows_sys::Win32::NetworkManagement::IpHelper::{
     GAA_FLAG_INCLUDE_GATEWAYS, GAA_FLAG_INCLUDE_PREFIX, GAA_FLAG_INCLUDE_TUNNEL_BINDINGORDER,
     GAA_FLAG_INCLUDE_WINS_INFO, IP_ADAPTER_ADDRESSES_LH,
 };
-use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR};
+use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6};
 
 
 #[derive(Debug, Eq, Hash, PartialEq)]
@@ -36,7 +37,11 @@ impl<T> Drop for FreeOnDrop<T> {
 }
 
 
-fn pstr_to_string(pstr: windows_sys::core::PSTR) -> String {
+fn pstr_to_string(pstr: windows_sys::core::PSTR) -> Option<String> {
+    if pstr.is_null() {
+        return None;
+    }
+
     // convert to UTF-16
     let buf_required_chars_i32 = unsafe {
         MultiByteToWideChar(
@@ -67,30 +72,108 @@ fn pstr_to_string(pstr: windows_sys::core::PSTR) -> String {
         panic!("MultiByteToWideChar tells me it copied {} bytes", copied_chars_i32);
     }
 
-    String::from_utf16(&utf16_buf)
-        .expect("MultiByteToWideChar returned invalid UTF-16 data")
+    Some(
+        String::from_utf16(&utf16_buf)
+            .expect("MultiByteToWideChar returned invalid UTF-16 data")
+    )
 }
 
-fn sockaddr_to_string(sockaddr: &SOCKADDR) -> String {
-    match sockaddr.sa_family {
+fn pwstr_to_string(pwstr: windows_sys::core::PWSTR) -> Option<String> {
+    if pwstr.is_null() {
+        return None;
+    }
+
+    let mut walker = pwstr;
+    let mut length = 0;
+    while unsafe { *walker } != 0x0000 {
+        length += 1;
+        walker = walker.wrapping_add(1);
+    }
+    let utf16_slice = unsafe { std::slice::from_raw_parts(pwstr, length) };
+    Some(
+        String::from_utf16(&utf16_slice)
+            .expect("invalid UTF-16 data")
+    )
+}
+
+fn sockaddr_to_string(sockaddr: *const SOCKADDR) -> Option<String> {
+    if sockaddr.is_null() {
+        return None;
+    }
+
+    let family = unsafe { *sockaddr }.sa_family;
+    match family {
         AF_INET => {
-            let mut array = [0u8; 4];
-            for (ab, sab) in array.iter_mut().zip(sockaddr.sa_data.iter()) {
-                *ab = *sab as u8;
-            }
-            Ipv4Addr::from(array).to_string()
+            let sockaddr_ipv4 = unsafe { &*(sockaddr as *const SOCKADDR_IN) };
+            let port = u16::from_be(sockaddr_ipv4.sin_port);
+            let ipv4_bits = u32::from_be(unsafe { sockaddr_ipv4.sin_addr.S_un.S_addr });
+            Some(SocketAddrV4::new(Ipv4Addr::from_bits(ipv4_bits), port).to_string())
         },
         AF_INET6 => {
-            let mut array = [0u8; 16];
-            for (ab, sab) in array.iter_mut().zip(sockaddr.sa_data.iter()) {
-                *ab = *sab as u8;
+            let sockaddr_ipv6 = unsafe { &*(sockaddr as *const SOCKADDR_IN6) };
+            let port = u16::from_be(sockaddr_ipv6.sin6_port);
+            let mut addr_words = unsafe { sockaddr_ipv6.sin6_addr.u.Word };
+            for word in addr_words.iter_mut() {
+                *word = u16::from_be(*word);
             }
-            Ipv6Addr::from(array).to_string()
+            let scope_id = u32::from_be(unsafe { sockaddr_ipv6.Anonymous.sin6_scope_id });
+            Some(SocketAddrV6::new(Ipv6Addr::from(addr_words), port, sockaddr_ipv6.sin6_flowinfo, scope_id).to_string())
         },
         other => {
-            format!("unknown address family {:#06X} address {:?}", other, sockaddr.sa_data)
+            let data = unsafe { *sockaddr }.sa_data;
+            Some(format!("unknown address family {:#06X} address {:?}", other, data))
         },
     }
+}
+
+fn guid_to_string(guid: &GUID) -> String {
+    format!(
+        "{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+        guid.data1,
+        guid.data2,
+        guid.data3,
+        guid.data4[0],
+        guid.data4[1],
+        guid.data4[2],
+        guid.data4[3],
+        guid.data4[4],
+        guid.data4[5],
+        guid.data4[6],
+        guid.data4[7],
+    )
+}
+
+
+macro_rules! output_addresses {
+    (@has_flags, $addr:expr, $addr_type:expr, $addr_field:ident) => {
+        {
+            println!("{} addresses:", $addr_type);
+            let mut ac_addr = unsafe { (*$addr).$addr_field };
+            while !ac_addr.is_null() {
+                println!("  Address");
+                println!("    Flags: {}", unsafe { (*ac_addr).Anonymous.Anonymous }.Flags);
+                println!("    Length: {}", unsafe { (*ac_addr).Anonymous.Anonymous }.Length);
+                println!("    AddrLength: {}", unsafe { *ac_addr }.Address.iSockaddrLength);
+                println!("    Address: {:?}", sockaddr_to_string(unsafe { (*ac_addr).Address.lpSockaddr }));
+
+                ac_addr = unsafe { *ac_addr }.Next;
+            }
+        }
+    };
+    (@no_flags, $addr:expr, $addr_type:expr, $addr_field:ident) => {
+        {
+            println!("{} addresses:", $addr_type);
+            let mut ac_addr = unsafe { (*$addr).$addr_field };
+            while !ac_addr.is_null() {
+                println!("  Address");
+                println!("    Length: {}", unsafe { (*ac_addr).Anonymous.Anonymous }.Length);
+                println!("    AddrLength: {}", unsafe { *ac_addr }.Address.iSockaddrLength);
+                println!("    Address: {:?}", sockaddr_to_string(unsafe { (*ac_addr).Address.lpSockaddr }));
+
+                ac_addr = unsafe { *ac_addr }.Next;
+            }
+        }
+    };
 }
 
 
@@ -154,18 +237,84 @@ fn main() {
         println!("IfIndex: {}", unsafe { (*addr).Anonymous1.Anonymous }.IfIndex);
         println!("Length: {}", unsafe { (*addr).Anonymous1.Anonymous }.Length);
         println!("AdapterName: {:?}", pstr_to_string(unsafe { *addr }.AdapterName));
-        println!("Unicast addresses:");
 
-        let mut uc_addr = unsafe { (*addr).FirstUnicastAddress };
-        while !uc_addr.is_null() {
-            println!("  Address");
-            println!("    Flags: {}", unsafe { (*uc_addr).Anonymous.Anonymous }.Flags);
-            println!("    Length: {}", unsafe { (*uc_addr).Anonymous.Anonymous }.Length);
-            println!("    Address: {}", sockaddr_to_string(&unsafe { *(*uc_addr).Address.lpSockaddr }));
+        output_addresses!(@has_flags, addr, "Unicast", FirstUnicastAddress);
+        output_addresses!(@has_flags, addr, "Anycast", FirstAnycastAddress);
+        output_addresses!(@has_flags, addr, "Multicast", FirstMulticastAddress);
 
-            uc_addr = unsafe { *uc_addr }.Next;
+        println!("DNS suffix: {:?}", pwstr_to_string(unsafe { *addr }.DnsSuffix));
+        println!("Description: {:?}", pwstr_to_string(unsafe { *addr }.Description));
+        println!("Friendly name: {:?}", pwstr_to_string(unsafe { *addr }.FriendlyName));
+
+        print!("Physical address:");
+        let addr_len: usize = usize::try_from(unsafe { *addr }.PhysicalAddressLength).unwrap()
+            .min(unsafe { *addr }.PhysicalAddress.len());
+        for b in &unsafe { *addr }.PhysicalAddress[..addr_len] {
+            print!(" {:02X}", b);
+        }
+        println!();
+
+        println!("Flags: {}", unsafe { (*addr).Anonymous2.Flags });
+        println!("MTU: {}", unsafe { *addr }.Mtu);
+        println!("IfType: {}", unsafe { *addr }.IfType);
+        println!("OperStatus: {}", unsafe { *addr }.OperStatus);
+        println!("Ipv6IfIndex: {}", unsafe { *addr }.Ipv6IfIndex);
+        for (i, zone_index) in unsafe { *addr }.ZoneIndices.iter().enumerate() {
+            println!("Zone index {}: {}", i, zone_index);
         }
 
+        println!("Prefixes:");
+        let mut pfx = unsafe { (*addr).FirstPrefix };
+        while !pfx.is_null() {
+            println!("  Prefix");
+            println!("    Flags: {}", unsafe { (*pfx).Anonymous.Anonymous }.Flags);
+            println!("    Structure Length: {}", unsafe { (*pfx).Anonymous.Anonymous }.Length);
+            println!("    AddrLength: {}", unsafe { *pfx }.Address.iSockaddrLength);
+            println!("    Address: {:?}", sockaddr_to_string(unsafe { (*pfx).Address.lpSockaddr }));
+            println!("    Prefix Length: {}", unsafe { *pfx }.PrefixLength);
+
+            pfx = unsafe { *pfx }.Next;
+        }
+
+        println!("Transmit speed: {}", unsafe { *addr }.TransmitLinkSpeed);
+        println!("Receive speed: {}", unsafe { *addr }.ReceiveLinkSpeed);
+
+        output_addresses!(@no_flags, addr, "WINS server", FirstWinsServerAddress);
+        output_addresses!(@no_flags, addr, "Gateway", FirstGatewayAddress);
+
+        println!("IPv4 Metric: {}", unsafe { *addr }.Ipv4Metric);
+        println!("IPv6 Metric: {}", unsafe { *addr }.Ipv6Metric);
+        println!("LUID: {}", unsafe { (*addr).Luid.Value });
+        println!("DHCPv4 server: {:?}", sockaddr_to_string(unsafe { *addr }.Dhcpv4Server.lpSockaddr));
+        println!("Compartment ID: {}", unsafe { *addr }.CompartmentId);
+        println!("Network GUID: {}", guid_to_string(&unsafe { *addr }.NetworkGuid));
+        println!("Connection type: {}", unsafe { *addr }.ConnectionType);
+        println!("Tunnel type: {}", unsafe { *addr }.TunnelType);
+        println!("DHCPv6 server: {:?}", sockaddr_to_string(unsafe { *addr }.Dhcpv6Server.lpSockaddr));
+
+        let duid_length = usize::try_from(unsafe { *addr }.Dhcpv6ClientDuidLength).unwrap()
+            .min(unsafe { *addr }.Dhcpv6ClientDuid.len());
+        let duid = &unsafe { *addr }.Dhcpv6ClientDuid[..duid_length];
+        println!("DHCPv6 client DUID: {:?}", duid);
+        println!("DHCPv6 IAID: {}", unsafe { *addr }.Dhcpv6Iaid);
+
+        println!("DNS suffixes:");
+        let mut sfx = unsafe { (*addr).FirstDnsSuffix };
+        while !sfx.is_null() {
+            let string_copy = unsafe { *sfx }.String;
+            let nul_index = string_copy
+                .iter()
+                .position(|w| *w == 0x0000)
+                .unwrap_or(string_copy.len());
+            let string_slice = &string_copy[..nul_index];
+            let string = String::from_utf16(string_slice)
+                .expect("invalid UTF-16 DNS suffix");
+            println!("  Suffix: {:?}", string);
+
+            sfx = unsafe { *sfx }.Next;
+        }
+
+        println!();
         addr = unsafe { *addr }.Next;
     }
     drop(buffer);
